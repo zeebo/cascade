@@ -1,9 +1,5 @@
 package cascade
 
-import (
-	"encoding/binary"
-)
-
 // bitReader abstracts reading values from a byte array where the
 // values are all some size in bits. The lowest order bits are
 // used in the uint64s, and the number of bits per value must
@@ -23,14 +19,13 @@ func newBitReader(buf []byte, bits uint) bitReader {
 }
 
 func (br *bitReader) rawRead(n uint) uint64 {
-	var tmp [8]byte
+	var tmp u64
 	copy(tmp[:], br.buf[n:])
-	return binary.LittleEndian.Uint64(tmp[:])
+	return tmp.toUint64()
 }
 
 func (br *bitReader) rawWrite(n uint, val uint64) {
-	var tmp [8]byte
-	binary.LittleEndian.PutUint64(tmp[:], val)
+	tmp := toU64(val)
 	copy(br.buf[n:], tmp[:])
 }
 
@@ -42,8 +37,8 @@ func (br *bitReader) Get(idx uint) uint64 {
 func (br *bitReader) Put(idx uint, val uint64) {
 	b := idx * br.bits
 	n, o := b/8, b%8
-	v := br.rawRead(n)
-	v &^= br.mask << o
-	v |= val & br.mask << o
-	br.rawWrite(n, v)
+	v := br.rawRead(n)      // read existing 8 bytes at n
+	v &^= br.mask << o      // clear the bits we're going to be setting
+	v |= val & br.mask << o // set the bits from the value
+	br.rawWrite(n, v)       // write it back
 }
