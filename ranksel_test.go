@@ -94,15 +94,61 @@ func TestRSQFData(t *testing.T) {
 		buf := make([]byte, 2*(17+8)+7)
 		data := newRSQFData(&buf[0], 7, 1)
 
+		defer func() {
+			fmt.Println("---")
+			binBlock2(data.getBlock(0), data.getBlock(1))
+		}()
+
 		// fill almost all of it
 		for i := 0; i < 120; i++ {
 			quo := rng.Uint64() % 128
+			fmt.Println("===")
 			fmt.Printf("%sv\n", strings.Repeat(" ", int(5+quo+quo/64)))
 			binBlock2(data.getBlock(0), data.getBlock(1))
 			assert.That(t, data.Insert(quo<<1|1))
 			assert.That(t, data.Lookup(quo<<1|1))
-			fmt.Println()
+			fmt.Println("---")
+			fmt.Printf("%sv\n", strings.Repeat(" ", int(5+quo+quo/64)))
+			binBlock2(data.getBlock(0), data.getBlock(1))
 		}
+	})
+
+	t.Run("Offsets", func(t *testing.T) {
+		buf := make([]byte, 2*(17+8)+7)
+		data := newRSQFData(&buf[0], 7, 1)
+
+		data.Insert(0 << 1)
+		binBlock2(data.getBlock(0), data.getBlock(1))
+
+		data.Insert(0 << 1)
+		binBlock2(data.getBlock(0), data.getBlock(1))
+
+		data.Insert(0 << 1)
+		binBlock2(data.getBlock(0), data.getBlock(1))
+
+		data.Insert(127 << 1)
+		binBlock2(data.getBlock(0), data.getBlock(1))
+
+		data.Insert(127 << 1)
+		binBlock2(data.getBlock(0), data.getBlock(1))
+
+		data.Insert(127 << 1)
+		binBlock2(data.getBlock(0), data.getBlock(1))
+
+		data.Insert(63 << 1)
+		binBlock2(data.getBlock(0), data.getBlock(1))
+
+		data.Insert(63 << 1)
+		binBlock2(data.getBlock(0), data.getBlock(1))
+
+		data.Insert(63 << 1)
+		binBlock2(data.getBlock(0), data.getBlock(1))
+
+		data.Insert(64 << 1)
+		binBlock2(data.getBlock(0), data.getBlock(1))
+
+		assert.Equal(t, data.getBlock(0).offset, uint8(5))
+		assert.Equal(t, data.getBlock(1).offset, uint8(3))
 	})
 }
 

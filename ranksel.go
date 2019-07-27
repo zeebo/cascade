@@ -1,7 +1,6 @@
 package cascade
 
 import (
-	"fmt"
 	"math/bits"
 	"unsafe"
 )
@@ -109,7 +108,7 @@ func (r *rsqfData) occupiedRank(s, b uint64) uint {
 	// we remove off lower order bits and keep at most b higher order bits.
 	occ := r.getBlock(idx).occupied.toUint64()
 	occ >>= off
-	occ <<= 64 - (b % 64)
+	occ <<= 64 - b + off
 	rank := uint(bits.OnesCount64(occ))
 
 	// if we overflow a single uint64, then grab the next one.
@@ -126,40 +125,41 @@ func (r *rsqfData) occupiedRank(s, b uint64) uint {
 func (r *rsqfData) runendsSelect(s, b uint64) uint {
 	idx, off, acc := s/64, uint(s%64), uint(0)
 
-check:
-	run := r.getBlock(idx).runends.toUint64() >> off
+	for {
+		run := r.getBlock(idx).runends.toUint64() >> off
 
-	// use popcount to traverse a word at a time.
-	if count := uint64(bits.OnesCount64(run)); count <= b {
-		acc += 64 - off
-		b -= count
-		off, idx = 0, idx+1
-		goto check
-	}
+		// use popcount to traverse a word at a time.
+		if count := uint64(bits.OnesCount64(run)); count <= b {
+			acc += 64 - off
+			b -= count
+			off, idx = 0, idx+1
+			continue
+		}
 
-	// now that we're in a word, see if we can pop off as many bits as possible
-	if count := uint64(bits.OnesCount32(uint32(run))); count <= b {
-		acc += 32
-		run >>= 32
-		b -= count
-	}
-	if count := uint64(bits.OnesCount16(uint16(run))); count <= b {
-		acc += 16
-		run >>= 16
-		b -= count
-	}
-	if count := uint64(bits.OnesCount8(uint8(run))); count <= b {
-		acc += 8
-		run >>= 8
-		b -= count
-	}
+		// now that we're in a word, see if we can pop off as many bits as possible
+		if count := uint64(bits.OnesCount32(uint32(run))); count <= b {
+			acc += 32
+			run >>= 32
+			b -= count
+		}
+		if count := uint64(bits.OnesCount16(uint16(run))); count <= b {
+			acc += 16
+			run >>= 16
+			b -= count
+		}
+		if count := uint64(bits.OnesCount8(uint8(run))); count <= b {
+			acc += 8
+			run >>= 8
+			b -= count
+		}
 
-	// clear off the b lowest order bits in run
-	for ; b > 0; b-- {
-		run &= run - 1
-	}
+		// clear off the b lowest order bits in run
+		for ; b > 0; b-- {
+			run &= run - 1
+		}
 
-	return acc + uint(bits.TrailingZeros64(run))
+		return acc + uint(bits.TrailingZeros64(run))
+	}
 }
 
 // Lookup reports true for any hash that has been inserted and possibly for some
@@ -170,20 +170,23 @@ func (r *rsqfData) Lookup(hash uint64) bool {
 	rem := hash & r.remMask
 	quo := (hash >> (r.remBits % 64)) & r.quoMask
 
-	fmt.Printf("L find hash:%d quo:%d rem:%d\n", hash, quo, rem)
-
 	// grab the block for the provided hash.
 	idx, off := quo/64, uint(quo%64)
 	bl := r.getBlock(idx)
 
 	// if the quotient isn't occupied, we're done.
 	if bl.occupied.toUint64()>>off&1 == 0 {
-		fmt.Println("L find unoccupied")
 		return false
 	}
 
-	// compute where the end of the run containing the quotient would be.
-	slot := r.rankSelect(quo)
+	// find the end of the run with the largest quotient less than or
+	// equal to our quotient. if that run ends before the quotient, it
+	// must be empty. the boolean indicates if doesn't exist and must
+	// be empty.
+	slot, ok := r.rankSelect(quo)
+	if !ok || slot < quo {
+		return false
+	}
 
 	// grab the block for the computed index.
 	idx, off = slot/64, uint(slot%64)
@@ -196,11 +199,14 @@ func (r *rsqfData) Lookup(hash uint64) bool {
 		// check for remainder matching, remainder never matching, or run ending.
 		if slotRem := r.getRemainder(bl, r.remBits*off) & r.remMask; slotRem == rem {
 			return true
-		} else if slotRem < rem || runs&sel != 0 {
+		} else if slot < quo || runs&sel != 0 {
 			return false
 		}
 
-		// walk back an offset if possible.
+		// walk backwards a slot.
+		slot--
+
+		// cheaply update state.
 		if off > 0 {
 			off--
 			sel >>= 1
@@ -215,6 +221,215 @@ func (r *rsqfData) Lookup(hash uint64) bool {
 	}
 }
 
+// Insert adds the hash to the filter so that Lookup will definitely report
+// yes. If Insert reports false, then any more inserts to the filter may cause
+// corrupted state. It should never report false if the hashes are randomly
+// distributed.
+func (r *rsqfData) Insert(hash uint64) (good bool) {
+	good = true
+
+	defer func() {
+		// runends should always have the same number of total bits as occupied
+		occ, rem := 0, 0
+		for j := uint64(0); j < 1<<r.quoBits; j++ {
+			bl := r.getBlock(j)
+			occ += bits.OnesCount64(bl.occupied.toUint64())
+			rem += bits.OnesCount64(bl.runends.toUint64())
+		}
+		if occ != rem {
+			panic("mismatch")
+		}
+	}()
+
+	// break out the remainder and quotient.
+	rem := hash & r.remMask
+	quo := (hash >> (r.remBits % 64)) & r.quoMask
+
+	// get the block that contains the quotient and keep track of the
+	// slot inside of the block that the quotient is at.
+	idx, off := quo/64, uint(quo%64)
+	bl := r.getBlock(idx)
+
+	// find the end of the run with the largest quotient less than or
+	// equal to our quotient. if that run ends before the quotient, it
+	// must be empty. the boolean indicates if doesn't exist and must
+	// be empty.
+	slot, ok := r.rankSelect(quo)
+	if !ok || slot < quo {
+		r.putRemainder(bl, r.remBits*off, rem)
+		bl.occupied = toU64(bl.occupied.toUint64() | 1<<off)
+		bl.runends = toU64(bl.runends.toUint64() | 1<<off)
+
+		// whenevr we set a runends bit, we need to check if the offset
+		// for the block needs to be incremented. we also need to ensure
+		// that there's still room in the offset.
+		if bl.offset == uint8(off) {
+			bl.offset++
+			good = good && bl.offset < 255
+		}
+
+		return good
+	}
+
+	// we may end up doing most of the work in a different block than
+	// the quotient. save the quotient block because we'll need it at
+	// the end.
+	qbl, qoff := bl, off
+
+	// since a run for a quotient always starts at least as large as the
+	// quotient for the run, and by the guarantees of rankSelect, we know
+	// that slot points at the end of our run. thus, we must want to insert
+	// one past the end of our run
+	slot++
+
+	// but this slot might already be full, so we have to find the first
+	// unused slot.
+	last := r.findFirstUnused(slot)
+
+	// now we have to start inserting. this means shifting all of the
+	// remainders and runends bits down from slot to last. additionally
+	// we know that any representitive runs that intersect this range
+	// must be fully contained in it (runs are always gapless). thus
+	// by sliding them down, their offsets must increase.
+
+	idx, off = last/64, uint(last%64)
+	roff := r.remBits * off
+	bl = r.getBlock(idx)
+	runs := bl.runends.toUint64()
+
+	for last > slot {
+		// set up the values for the slot one smaller than the slot in last.
+		nbl, nidx, noff, nroff, nruns := bl, idx, off, roff, runs
+		if off > 0 {
+			noff--
+			nroff -= r.remBits
+		} else {
+			nidx--
+			noff = 63
+			nroff = r.remBits * 63
+			nbl = r.getBlock(nidx)
+			nruns = nbl.runends.toUint64()
+		}
+
+		// uncondintonally move the remainder up one.
+		r.putRemainder(bl, roff, r.getRemainder(nbl, nroff))
+
+		// flip the runends bit if it's different.
+		if runs>>off&1 != nruns>>noff&1 {
+			runs ^= 1 << off
+
+			// since we flipped a bit, we may have just increased an offset.
+			if bl.offset == uint8(off) {
+				bl.offset++
+				good = good && bl.offset < 255
+			}
+		}
+
+		// if we're going to be in the next block, update the runends bit
+		// vector that we've been storing in a temporary variable for
+		// modifications.
+		if bl != nbl {
+			bl.runends = toU64(runs)
+		}
+
+		// decrement last and update the state to match.
+		last--
+		bl, idx, off, roff = nbl, nidx, noff, nroff
+	}
+
+	// so now we know that last == slot and slot is able to be written to.
+	// slot is also one past the end of the run.
+	r.putRemainder(bl, roff, rem)
+
+	// the end of the run may be for this quotient or it may be for some earlier
+	// quotient. in either case, the current slot is getting runends and the
+	// remainder is being set.
+	runs |= 1 << off
+
+	// moving this assignment from runs to the end does double duty because it's
+	// storing the changes and also cleaning up from the loop in case it did not
+	// end on a block transition.
+	bl.runends = toU64(runs)
+
+	// if we haven't ever stored to this quotient, then the previous slot must
+	// be the end of a previous run, so we just need to set occupied and finish.
+	if occs := qbl.occupied.toUint64(); occs>>qoff&1 == 0 {
+		occs |= 1 << qoff
+		qbl.occupied = toU64(occs)
+	} else {
+		// we have to clear the previous runends bit because it must be part
+		// of the run for the quotient we just inserted into.
+		if off > 0 {
+			off--
+		} else {
+			idx, off = idx-1, 63
+		}
+
+		bl := r.getBlock(idx)
+		runs := bl.runends.toUint64()
+		runs &^= 1 << off
+		bl.runends = toU64(runs)
+
+		// we only want to update the offset if we're deleting. consider putting
+		// a runend next to an offset vs incrementing it.
+		if bl.offset-1 == uint8(off) {
+			bl.offset++
+			good = good && bl.offset < 255
+		}
+	}
+
+	return good
+}
+
+// rankSelect returns where the run for the quo ends and a boolean indicating
+// if that ending is occupied. If the run ends before the quotient, then the
+// quotient has nothing stored in it's slot.
+func (r *rsqfData) rankSelect(quo uint64) (slot uint64, ok bool) {
+	// find the representitive quotient for the provided quotient
+	rep := quo &^ 63
+
+	// grab the appropriate block
+	bl := r.getBlock(quo / 64)
+
+	// the offset points at where the representitve quotient's run would start.
+	// in other words, it is the smallest offset such that all runs after it
+	// have a quotient at least as large as the representitive.
+	off := uint64(bl.offset)
+
+	// the number of bits we want to read spans from the represntitive to the
+	// quotient. we add 1 so that it's inclusive of the quotient.
+	b := quo - rep + 1
+
+	// determine how many quotients exist between the repsentitive and the provided
+	// quotient, inclusive.
+	d := uint64(r.occupiedRank(rep, b))
+	if d == 0 {
+		// if there are none, then
+		return rep + off - 1, false
+	}
+
+	// there exist d bits and select returns the index of the nth bit passed
+	// to it past the provided bit offset. adding that in will give us the
+	// location of the end of the largest run of remainders with quotient
+	// less than or equal to the provided quotient.
+	t := uint64(r.runendsSelect(end, d-1))
+	// fmt.Printf("    t:%d\n", t)
+	return end + t, true
+}
+
+// findFirstUnused finds the first unused slot after the quotient.
+func (r *rsqfData) findFirstUnused(quo uint64) uint64 {
+	for j := uint64(0); j <= r.quoMask; j++ {
+		slot, ok := r.rankSelect(quo)
+		if quo > slot || !ok {
+			return quo
+		}
+		quo = slot + 1
+	}
+	panic("too many iterations")
+}
+
+/*
 // Insert adds the hash to the filter so that Lookup will definitely report
 // yes. If insert reports false, then the filter is in a broken state and no
 // further operations should be performed on it. This should never happen if
@@ -243,19 +458,18 @@ func (r *rsqfData) Insert(hash uint64) bool {
 	idx, off := quo/64, uint(quo%64)
 	bl := r.getBlock(idx)
 
-	// compute where the end of the run for the quotient is.
-	slot := r.rankSelect(quo)
-	fmt.Printf("I init quo:%d rem:%d idx:%d off:%d slot:%d\n", quo, rem, idx, off, slot)
-
-	// if the slot is before our quotient, or equal to it and it's the first
-	// quotient inside of the block, then the quotient is missing and the
-	// slot is empty.
-	if slot < quo {
+	// if the slot is earlier than the quotient or there were no bits in
+	// the set up to the quotient, then just set it and bail
+	slot, ok := r.rankSelect(quo)
+	if !ok || slot < quo {
+		fmt.Printf("I done slot:%d quo:%d ok:%t\n", slot, quo, ok)
 		r.putRemainder(bl, r.remBits*off, rem)
 		bl.occupied = toU64(bl.occupied.toUint64() | 1<<off)
 		bl.runends = toU64(bl.runends.toUint64() | 1<<off)
 		return true
 	}
+
+	fmt.Printf("I init quo:%d rem:%d idx:%d off:%d slot:%d\n", quo, rem, idx, off, slot)
 
 	// save the location of the quotient for later.
 	qbl, qoff := bl, off
@@ -264,14 +478,13 @@ func (r *rsqfData) Insert(hash uint64) bool {
 	slot++
 
 	// grab the block containing the first unused value past the slot.
-	last, numRuns := r.findFirstUnused(slot)
+	last := r.findFirstUnused(slot)
 	idx, off = last/64, uint(last%64)
 	roff := r.remBits * off
 	bl = r.getBlock(idx)
 	runs := bl.runends.toUint64()
 
-	fmt.Printf("I find slot:%d last:%d quo:%d runs:%d\n", slot, last, quo, numRuns)
-	quo += numRuns // keep track of what quotient the slot is in
+	fmt.Printf("I find slot:%d last:%d off:%d quo:%d\n", slot, last, off, quo)
 
 	// copy things backwards until we get to slot.
 	for last > slot {
@@ -291,15 +504,19 @@ func (r *rsqfData) Insert(hash uint64) bool {
 		}
 
 		// keep track of if a run is ending.
+		ends := runs >> off & 1
 		nends := nruns >> noff & 1
 
 		// unconditionally set the remainder to the next one.
 		r.putRemainder(bl, roff, r.getRemainder(nbl, nroff))
 
 		// check if the next runends bit is different, and if so, flip it.
-		fmt.Printf("I flip idx:%d off:%d quo:%d ends:%t\n", idx, off, quo, runs>>off&1 != nends)
-		if runs>>off&1 != nends {
+		fmt.Printf("I flip idx:%d off:%d quo:%d ends:%d nends:%d\n", idx, off, quo, ends, nends)
+		if ends != nends {
 			runs ^= 1 << off
+			if bl.offset == uint8(off) {
+				bl.offset++
+			}
 		}
 
 		// update runends when we switch blocks
@@ -307,14 +524,8 @@ func (r *rsqfData) Insert(hash uint64) bool {
 			bl.runends = toU64(runs)
 		}
 
-		// if we're on a representitive quotient, increment the offset
-		if quo&63 == 0 {
-			bl.offset++
-		}
-		quo -= nends
-
 		// update to the next state.
-		bl, idx, off, roff = nbl, nidx, noff, nroff
+		bl, idx, off, roff, ends = nbl, nidx, noff, nroff, nends
 	}
 
 	// always assign in case the loop didn't end on another block
@@ -328,61 +539,31 @@ func (r *rsqfData) Insert(hash uint64) bool {
 	// idx, off and roff are the appropriate values.
 	r.putRemainder(bl, roff, rem)
 	bl.runends = toU64(bl.runends.toUint64() | 1<<off)
-	if off == 0 {
-		bl.offset++
-	}
 
 	// if the quotient is unoccupied, flag it as occupied and we're done.
 	if qbl.occupied.toUint64()>>qoff&1 == 0 {
 		qbl.occupied = toU64(qbl.occupied.toUint64() | 1<<qoff)
+		if bl.offset == uint8(off) || qoff == 0 {
+			bl.offset++
+		}
 		return true
 	}
 
 	// otherwise, clear the previous runends bit and bump the offset if
 	// our quotient is a representitive quotient.
 	if off > 0 {
-		fmt.Printf("I del  idx:%d off:%d\n", idx, off-1)
-		bl.runends = toU64(bl.runends.toUint64() &^ (1 << (off - 1)))
+		off--
 	} else {
-		fmt.Printf("I del  idx:%d off:%d\n", idx-1, 63)
-		nbl := r.getBlock(idx - 1)
-		nbl.runends = toU64(nbl.runends.toUint64() &^ (1 << 63))
+		idx, off = idx-1, 63
 	}
-	if quo&63 == 0 {
+
+	fmt.Printf("I del  idx:%d off:%d\n", idx, off)
+	bl = r.getBlock(idx)
+	bl.runends = toU64(bl.runends.toUint64() &^ (1 << off))
+	if bl.offset == uint8(off) {
 		bl.offset++
 	}
 
-	// if we're at an offset of 255, more adds are unsafe.
-	return bl.offset < 255
+	return true
 }
-
-func (r *rsqfData) rankSelect(slot uint64) (uint64, bool) {
-	rep := slot &^ 63
-	off := uint64(r.getBlock(slot / 64).offset)
-	b := slot - rep + 1
-
-	d := uint64(r.occupiedRank(rep+off, b))
-	if d == 0 {
-		fmt.Printf("R dead kind:rank quo:%d d:%d b:%d\n", slot, d, b)
-		return 0, false
-	}
-
-	t := uint64(r.runendsSelect(rep+off, d))
-	fmt.Printf("R rank kind:sel quo:%d slot:%d d:%d b:%d t:%d off:%d\n", slot, rep+off+t, d, b, t, off)
-	return rep + off + t, true
-}
-
-// findFirstUnused finds the first unused slot after the quotient.
-func (r *rsqfData) findFirstUnused(quo uint64) (uint64, uint64) {
-	runs := uint64(0)
-	for j := uint64(0); j < r.quoMask; j++ {
-		slot, ok := r.rankSelect(quo)
-		if quo > slot || !ok {
-			return quo, runs
-		}
-		quo = slot + 1
-		runs++
-	}
-
-	panic("too many iterations")
-}
+*/
